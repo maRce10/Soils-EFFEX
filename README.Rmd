@@ -1,8 +1,8 @@
 ---
-title: soils_earth_forest_fertilization_experiment
+title: Soils EFFEx
 author: Marcelo Araya-Salas & Andrea Vincent
 output: github_document
-date: `r format(Sys.Date(), "%d-%m-%Y")`
+date: "`r format(Sys.Date(), '%d-%m-%Y')`"
 editor_options:
   chunk_output_type: console
 ---
