@@ -1,0 +1,452 @@
+---
+title: <center><font size="7"><b>Data analysis</b></font></center>
+subtitle: <center><font size="4"><b>Soils EFFEX</b> <br></font></center>
+author: <center><font size="3"><a href="http://researcher.website.com/">Researcher name</a></font></center>
+date: <center>"`r Sys.Date()`"</center>
+output:
+  html_document:
+    # code_folding: show
+    css: extra.css
+    df_print: tibble
+    highlight: pygments  
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+fontsize: 12pt 
+editor_options: 
+  chunk_output_type: console
+---
+
+<!-- this code add line numbers to code blocks -->
+<!-- only works when code folding is not used in yaml (code_folding: show) -->
+
+<style>
+body
+  { counter-reset: source-line 0; }
+pre.numberSource code
+  { counter-reset: none; }
+</style>
+
+```{r load packages, echo = FALSE, message = FALSE, warning=FALSE}
+
+# github packages must include user name ("user/package")
+# knitr is require for creating html/pdf/word reports
+# kableExtra is used to print pretty formatted tables 
+# formatR is used for soft-wrapping code
+# klippy is used for adding a copy button to each code block
+pkgs <- c("rlesur/klippy", "kableExtra", "knitr", "formatR", "rprojroot", "ggplot2", "readxl", "corrplot", "viridis", "caret", "brms")
+
+# install/ load packages
+out <- lapply(pkgs, function(y) {
+  
+  # get pakage name
+  pkg <- strsplit(y, "/")[[1]]
+  pkg <- pkg[length(pkg)]
+  
+  # check if installed, if not then install 
+  if (!pkg %in% installed.packages()[,"Package"])  {
+
+      if (grepl("/", y))  remotes::install_github(y, force = TRUE) else
+    install.packages(y) 
+    }
+
+  # load package
+  a <- try(require(pkg, character.only = T), silent = T)
+
+  if (!a) remove.packages(pkg)
+  })
+
+# set working directory as project directory or one directory above,
+rootdir <- try(rprojroot::find_rstudio_root_file(), silent = TRUE)
+if (is(rootdir, "try-error")) rootdir <-  ".."
+opts_knit$set(root.dir = rootdir)
+
+# options to customize chunk outputs
+knitr::opts_chunk$set(
+  class.source = "numberLines lineAnchors", # for code line numbers
+  tidy.opts = list(width.cutoff = 65), 
+  tidy = TRUE,
+  message = FALSE
+ )
+
+# this is a customized printing style data frames 
+# screws up tibble function
+tibble <- function(x, ...) { 
+  x <- kbl(x, digits=4, align= 'c', row.names = FALSE) 
+   x <- kable_styling(x, position ="center", full_width = FALSE,  bootstrap_options = c("striped", "hover", "condensed", "responsive")) 
+   asis_output(x)
+}
+
+registerS3method("knit_print", "data.frame", tibble)
+
+# to add copy button to code blocks
+klippy::klippy(position = c('top', 'right'))
+
+```
+
+
+```{r functions and parameters}
+
+cols <- viridis(10, alpha = 0.6)
+
+selected_vars <- c("tc.g.kg.18", "tn.g.kg.18", "tp.g.kg.18", "ph.h2o", "ph.cacl2", "K", "resin.p", "Al", "Fe", "Mg", "Mn", "Na", "ECEC", "Ca")
+
+# print results brms models
+summary_brm_model <- function(x = NULL, gsub.pattern = NULL, gsub.replacement = NULL, xlab = "Effect size", n.subposts = 2000, model_name = NULL, read.file = NULL, plot.area.prop = 0.9){
+  
+  if (is.null(x) & !is.null(read.file))
+    x <- readRDS(read.file)
+  
+  # extract info from model
+  summ <- summary(x)$fixed
+  fit <- x$fit  
+  betas <- grep("^b_", names(fit@sim$samples[[1]]), value = TRUE)  
+  
+   # subsample posteriors
+  xdrws <- brms::as_draws(x)
+  
+  # only apply thinning if length of posterior < n.subposts
+  if (length(xdrws[[1]][[1]]) < n.subposts)
+  xdrws <- posterior::thin_draws(xdrws, round(length(xdrws[[1]][[1]]) / n.subposts, 0))
+
+  xdrws <- posterior::subset_draws(x = xdrws, variable = betas)
+  sub_posts_by_chain_list <- lapply(1:length(xdrws), function(x) {
+      X <- as.data.frame(xdrws[[x]])
+      X$chain <- paste("chain", x)
+      return(X)
+      })
+  sub_posts_by_chain <- do.call(rbind, sub_posts_by_chain_list)
+  
+  merged_xdrws <- posterior::merge_chains(xdrws)
+  sub_posts <- as.data.frame(merged_xdrws)
+  names(sub_posts) <- betas
+  
+  hdis <- t(sapply(betas, function(y)   HDInterval::hdi(sub_posts[, colnames(sub_posts) == y]))
+)
+  coef_table <- data.frame(summ, hdis)
+  coef_table <- coef_table[rownames(coef_table) != "Intercept", c("Estimate", "Rhat", "Bulk_ESS", "l.95..CI", "u.95..CI")]
+  
+  # add priors to model table
+  pt <- prior_summary(x)
+  b_prior <- pt$prior[pt$class == "b" & pt$coef == ""]
+  b_prior <- if (b_prior == "") "flat" else b_prior
+ 
+  sd_prior <- unique(pt$prior[pt$class == "sd" & pt$coef == ""])
+  sd_prior <- if (length(sd_prior) > 1)
+      sd_prior[sd_prior != ""] else "flat"
+  sd_prior <- if (sd_prior == "") "flat" else sd_prior
+ 
+   model_table <- data.frame(b_prior, sd_prior, iterations = fit@stan_args[[1]]$iter, chains = length(attr(fit, "stan_args")), thinning = fit@stan_args[[1]]$thin, warmup = fit@stan_args[[1]]$warmup)
+
+ 
+  np <- brms::nuts_params(x)
+  model_table$diverg_transitions <- sum(subset(np, Parameter == "divergent__")$Value)
+  model_table$`rhats > 1.05` <- sum(na.omit(brms::rhat(x)) > 1.05)
+ 
+  
+  coef_table <- as.data.frame(coef_table)  
+  coef_table$Rhat <- round(coef_table$Rhat, digits = 3)  
+  coef_table$CI_low <- round(unlist(coef_table$l.95..CI), digits = 3)  
+  coef_table$CI_high <- round(unlist(coef_table$u.95..CI), digits = 3)  
+  coef_table$l.95..CI <- coef_table$u.95..CI <- NULL
+   
+ out <- lapply(betas, function(y)  data.frame(variable = y, value = sort(sub_posts[, colnames(sub_posts) == y], decreasing = FALSE))) 
+ 
+  posteriors <- do.call(rbind, out)
+  posteriors <- posteriors[posteriors$variable != "b_Intercept", ]
+    posteriors$variable <- factor(posteriors$variable, levels = sort(unique(posteriors$variable)))
+    
+    names(sub_posts_by_chain)[1:(ncol(sub_posts_by_chain) - 1)] <- betas
+    
+ out2 <- lapply(betas, function(y)  {
+     X <- data.frame(variable = y, chain = sub_posts_by_chain[, "chain"], value = sub_posts_by_chain[, y])
+     X$iteration <- round(seq(1, fit@stan_args[[1]]$iter, length.out = nrow(X) / length(attr(fit, "stan_args"))))
+     return(X)
+     })
+  
+  posteriors_by_chain <- do.call(rbind, out2)
+  posteriors_by_chain <- posteriors_by_chain[posteriors_by_chain$variable != "b_Intercept", ]
+  
+  if (!is.null(gsub.pattern) & !is.null(gsub.replacement))
+    posteriors$variable <- gsub(pattern = gsub.pattern, replacement = gsub.replacement, posteriors$variable)
+  
+  if (!is.null(gsub.pattern) & !is.null(gsub.replacement))
+    posteriors_by_chain$variable <- gsub(pattern = gsub.pattern, replacement = gsub.replacement, posteriors$posteriors_by_chain)
+ 
+  posteriors_by_chain$variable <- factor(posteriors_by_chain$variable, levels = sort(levels(posteriors$variable), decreasing = TRUE))
+
+  coef_table2 <- coef_table
+  coef_table2$variable <- factor(paste0("b_", rownames(coef_table2)))
+  coef_table2$value <- coef_table2$Estimate
+  coef_table2$significance <- ifelse(coef_table2$CI_low * coef_table2$CI_high > 0, "sig", "non-sig")
+  coef_table2$significance <- factor(coef_table2$significance, levels = c("non-sig", "sig"))
+  
+  col_pointrange <- if(all(coef_table2$significance == "non-sig")) "gray" else
+    if(all(coef_table2$significance == "sig")) "black" else
+      c("gray", "black")
+  
+    gg_dists <- ggplot(data = posteriors, aes(y = variable, x = value, color = significance)) +
+        geom_vline(xintercept = 0, col = "black", lty = 2) + 
+  ggdist::stat_halfeye(aes(x = value), .width = c(.95), fill = viridis::viridis(10, alpha = 0.5)[8],  normalize = "panels", color = "transparent") +
+       geom_point(data = coef_table2) +
+        geom_errorbar(data = coef_table2, aes(xmin = CI_low, xmax = CI_high), width = 0) +
+        scale_color_manual(values = col_pointrange) +
+        theme(axis.ticks.length = unit(0, "pt"), plot.margin = margin(0,0,0,0,"pt"))+
+       labs(x = "Effect size", y = "Parameter") +
+        theme_classic() + 
+        facet_wrap(~ variable, scales = "free_y", ncol = 1, 
+strip.position = "right") +
+         theme(legend.position="none",
+  strip.background = element_blank(),
+  strip.text.y = element_blank()
+) + xlim(range(c(posteriors_by_chain$value, 0)) * plot.area.prop)
+
+     gg_traces <- ggplot(data = posteriors_by_chain, aes(x = iteration, y = value, color = chain)) +
+    geom_line() +
+         scale_color_viridis_d(alpha = 0.7, begin = 0.2, end = 0.9) +
+         facet_wrap(~ variable, scales = "free_y", ncol = 1, 
+strip.position = "right") +
+         theme_classic() + 
+         theme(legend.position="none",
+  strip.background = element_blank(),
+  strip.text.y = element_blank(),
+  axis.title.y=element_blank(),
+        axis.text.y=element_blank()
+)
+   
+  gg <- cowplot::plot_grid(gg_dists, gg_traces, ncol = 2, rel_widths = c(2, 1))
+     
+     if (!is.null(gsub.pattern) & !is.null(gsub.replacement))
+    rownames(coef_table) <- gsub(pattern = gsub.pattern, replacement = gsub.replacement, rownames(coef_table))
+   
+  coef_table$Rhat <- ifelse(coef_table$Rhat > 1.05, cell_spec(coef_table$Rhat, "html", color ="white", background = "red", bold = TRUE,  font_size = 12),  cell_spec(coef_table$Rhat, "html"))
+  
+  signif <- coef_table[,"CI_low"] * coef_table[,"CI_high"] > 0
+ 
+    model_table$diverg_transitions <- ifelse(model_table$diverg_transitions > 0, cell_spec(model_table$diverg_transitions, "html", color ="white", background = "red", bold = TRUE,  font_size = 12),  cell_spec(model_table$diverg_transitions, "html"))
+    
+    model_table$`rhats > 1.05` <- ifelse(model_table$`rhats > 1.05` > 0, cell_spec(model_table$`rhats > 1.05`, "html", color ="white", background = "red", bold = TRUE,  font_size = 12),  cell_spec(model_table$`rhats > 1.05`, "html"))
+
+  df1 <- kbl(model_table, row.names = TRUE, escape = FALSE, format = "html", digits = 3)
+    
+  df1 <- kable_styling(df1, bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE, font_size = 12)
+
+   
+  df2 <- kbl(coef_table, row.names = TRUE, escape = FALSE, format = "html", digits = 3)
+    
+  df2 <- row_spec(kable_input = df2, row =  which(coef_table$CI_low * coef_table$CI_high > 0), background = adjustcolor(cols[9], alpha.f = 0.3))
+
+  df2 <- kable_styling(df2, bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width = FALSE, font_size = 12)
+  
+  if (!is.null(model_name))
+    cat(paste('<font size="4"><b>', model_name, '</b></font><br>'))
+  
+    cat(paste('<font size="3"><b>', x$formula[1], '</b></font>'))
+  
+  print(df1)
+  print(df2)
+  
+  print(gg)
+}
+
+```
+
+# Read data
+
+
+
+<!-- skyblue box -->
+
+<div class="alert alert-info">
+
+
+
+
+
+</div>
+
+&nbsp; 
+
+
+```{r read data}
+
+dat <- as.data.frame(read_excel("./data/raw/strimastersoils2022.xlsx"))
+
+cm <- cor(dat[, selected_vars], use = "pairwise.complete.obs")
+
+corrplot.mixed(cm, lower = "number", upper = "ellipse", tl.col = "black", lower.col = cols, upper.col = cols, tl.pos = "lt", tl.cex = 1.4, order = "hclust")
+
+```
+
+
+```{r}
+
+dat <- dat[!is.na(dat$site),]
+
+comp.cases <- complete.cases(dat[, names(dat) %in% selected_vars])
+
+pca <- prcomp(dat[comp.cases, names(dat) %in% selected_vars],
+    scale. = TRUE)
+
+# add to data
+dat$PC1 <- dat$PC2 <- NA
+dat$PC1[comp.cases] <- pca$x[, 1]
+dat$PC2[comp.cases] <- pca$x[, 2]
+
+# plot rotation values by PC
+pca_rot <- as.data.frame(pca$rotation[, 1:4])
+
+pca_rot_stck <- stack(pca_rot)
+
+pca_rot_stck$variable <- rownames(pca_rot)
+pca_rot_stck$Sign <- ifelse(pca_rot_stck$values > 0, "Positive", "Negative")
+pca_rot_stck$rotation <- abs(pca_rot_stck$values)
+
+ggplot(pca_rot_stck, aes(x = variable, y = rotation, fill = Sign)) +
+    geom_col() + coord_flip() + scale_fill_viridis_d(alpha = 0.7,
+    begin = 0.3, end = 0.8) + facet_wrap(~ind) +
+    theme_classic()
+
+ggplot(dat, aes(x = PC1, y = PC2, color = treat, shape = site)) +
+ geom_point(size = 7)+
+  scale_shape_manual(values = c(15, 19)) +
+  scale_color_manual(values = viridis(4, alpha = 0.6)) +
+  theme_classic() +
+  labs(x = "PC1", y = "PC2", color = "Treatment", shape = "Site") +
+  theme(text = element_text(size=20), legend.position = c(0.9, 0.9),  legend.text = element_text(face="italic")) 
+
+```
+
+
+- +P addition will supress P enzymes BIS & MUP (P enzymes ~ P treatment + site)
+
+```{r}
+
+priors <- c(prior(normal(0, 4), class = "b"))
+chains <- 1
+iter <- 2000
+
+names(dat)
+
+dat$BIS_sc <- scale(dat$BIS)
+
+fit1 <- brm(BIS_sc ~ treat.pool.p + site, data = dat, iter = iter, chains = chains, cores = chains, family = gaussian(), prior = priors, file = "./data/processed/regression_models/BIS by P", file_refit = "always")
+
+```
+
+```{r}
+
+summary_brm_model(x = readRDS("./data/processed/regression_models/BIS by P.rds"), model_name = "BIS_sc ~ treat.pool.p * site", n.subposts = 1000)
+
+```
+
+
+```{r}
+
+dat <- as.data.frame(read_excel("./data/raw/strimastersoils2022.xlsx"))
+
+pp <- preProcess(x = as.matrix(dat[, selected_vars]), method=c("center", "scale", "BoxCox", "corr"))
+
+trans.dat <- data.frame(Species = dat$Species, predict(pp, as.matrix(dat[, - 1])), stringsAsFactors = FALSE)
+
+trans.dat$Species[trans.dat$Species == 2] <- "Calathea lutea"
+# trans.dat$rdn.var <- rnorm(nrow(trans.dat))
+
+trans.dat$Species <- as.factor(trans.dat$Species)
+
+# tune random forest
+rf_task <- makeClassifTask(data = trans.dat, target = "Species")
+ 
+# Estimate runtime
+estimateTimeTuneRanger(rf_task)
+
+# Tuning
+tuning.results <- tuneRanger(rf_task, measure = list(multiclass.brier), num.trees = 10000, num.threads = 10, iters = 1000, save.file.path = NULL, show.info = FALSE)
+  
+# Model with the new tuned hyperparameters
+lvs.rf <- ranger(Species ~ ., data = trans.dat, num.trees = 10000, importance = "impurity", keep.inbag = TRUE, mtry = tuning.results$recommended.pars$mtry, min.node.size = tuning.results$recommended.pars$min.node.size, sample.fraction = tuning.results$recommended.pars$sample.fraction)
+
+lvs.rf <- ranger(as.factor(Species) ~ ., data = trans.dat, num.trees = 10000, importance = "permutation", keep.inbag = TRUE)
+
+imp_pvals <- importance_pvalues(x = lvs.rf, formula = as.factor(Species) ~ ., data = trans.dat, method = "altman", num.permutations = 1000)
+
+prx.mat <- extract_proximity_oob(fit = lvs.rf, olddata = trans.dat)
+
+diss <- dist(t(prx.mat))   ## Euclidean distances 
+fit <- mds(diss, ndim = 2)        ## 2D interval MDS
+
+set.seed(123)
+rf.mds <- bootmds(fit, prx.mat, method.dat = "euclidean", nrep = 50)
+
+pboptions(type = "timer")
+  
+rnd.error <- pbsapply(1:10000, cl = 20, function(x){
+
+  Y <- trans.dat
+
+  Y$Species <- sample(Y$Species)
+
+  rf <- ranger(Species ~ ., data = Y, num.trees = 10000, keep.inbag = FALSE, mtry = tuning.results$recommended.pars$mtry, min.node.size = tuning.results$recommended.pars$min.node.size, sample.fraction = tuning.results$recommended.pars$sample.fraction)
+
+  rf.error <- rf$prediction.error
+
+  return(rf.error)
+  }
+  )
+
+rf.random.res <- list(rf.error = lvs.rf$prediction.error, rnd.error = rnd.error, rf.model = lvs.rf, prx.mat = prx.mat, rf.mds = rf.mds, trans.dat = trans.dat, imp_pvals = imp_pvals, tuning.results = tuning.results)
+
+saveRDS(rf.random.res, "./data/processed/Random forest leaf shape randomization test results.RDS")
+```
+
+
+
+<!-- light brown box -->
+
+
+<div class="alert alert-warning">
+
+# Report overview
+
+- You can have the sections listed here, for instance:
+
+  - [Lorem ipsum](#lorem-ipsum)
+  - [Takeaways](#takeaways)
+
+</div>
+
+&nbsp;
+
+
+
+<!-- light green box -->
+
+<div class="alert alert-success">
+
+&nbsp; 
+
+# Takeaways
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vestibulum in felis ut mauris consectetur sodales. Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+
+</div>
+
+&nbsp;
+
+<!-- '---' adds a gray vertical line -->
+
+---
+
+&nbsp; 
+ 
+ <!-- add packages used, system details and versions  -->
+ 
+<font size="4">Session information</font>
+
+```{r session info, echo=F}
+
+sessionInfo()
+
+```
